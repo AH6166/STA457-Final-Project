@@ -1,0 +1,279 @@
+```{r}
+library(rugarch)
+library(tseries)
+```
+
+
+SARIMAX + GARCH, 13-
+```{r}
+# SARIMAX + GARCH
+# Load libraries
+library(forecast)
+library(rugarch)
+library(tseries)
+
+# === 1. Load and prepare data ===
+data <- read.csv("/Users/kevin/Desktop/STA457_Project/price_climate.csv")
+data$Date <- as.Date(data[[1]])
+
+# External regressors
+xreg_all <- as.matrix(data[, c("PRCP_Monthly_Avg", "TAVG_Monthly_Avg")])
+price_series <- ts(data$Price_Monthly_Avg, frequency = 12)
+
+# === 2. Split into training and testing sets ===
+split_date <- as.Date("2018-11-30")
+train_index <- which(data$Date < split_date)
+test_index <- which(data$Date >= split_date)
+
+train_data <- data[train_index, ]
+test_data <- data[test_index, ]
+
+price_train <- ts(train_data$Price_Monthly_Avg, frequency = 12)
+price_test <- ts(test_data$Price_Monthly_Avg, frequency = 12)
+
+xreg_train <- xreg_all[train_index, ]
+xreg_test <- xreg_all[test_index, ]
+
+n_forecast <- nrow(test_data)
+cat("Forecast horizon:", n_forecast, "\n")
+
+# === 3. Fit SARIMAX model ===
+sarimax_model <- Arima(
+  y = price_train,
+  order = c(1, 1, 1),
+  seasonal = list(order = c(1, 1, 1), period = 12),
+  xreg = xreg_train
+)
+
+# === 4. Extract residuals and fit GARCH on them ===
+sarimax_resid <- residuals(sarimax_model)
+
+garch_spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(0, 0), include.mean = FALSE)
+)
+
+garch_fit <- ugarchfit(spec = garch_spec, data = sarimax_resid)
+
+# === 5. Forecast SARIMAX values for test period ===
+sarimax_forecast <- forecast(sarimax_model, xreg = xreg_test, h = n_forecast)
+predicted_prices <- as.numeric(sarimax_forecast$mean)
+
+# === 6. Evaluate performance ===
+actual_prices <- as.numeric(price_test)
+mse <- mean((actual_prices - predicted_prices)^2)
+rmse <- sqrt(mse)
+
+cat("✅ MSE:", round(mse, 4), "\n")
+cat("✅ RMSE:", round(rmse, 4), "\n")
+```
+ARIMAX + GARCH, 
+```{r}
+# 1. Load and prepare data
+data <- read.csv("/Users/kevin/Desktop/STA457_Project/price_climate.csv")
+data$Date <- as.Date(data[[1]])
+
+# External regressors matrix
+xreg_all <- as.matrix(data[, c("PRCP_Monthly_Avg", "TAVG_Monthly_Avg")])
+price_series <- ts(data$Price_Monthly_Avg)
+
+# 2. Split based on date
+split_date <- as.Date("2018-11-30")
+train_index <- which(data$Date < split_date)
+test_index <- which(data$Date >= split_date)
+
+train_data <- data[train_index, ]
+test_data <- data[test_index, ]
+
+price_train <- ts(train_data$Price_Monthly_Avg)
+price_test <- ts(test_data$Price_Monthly_Avg)
+length(price_test)
+xreg_train <- xreg_all[train_index, ]
+xreg_test <- xreg_all[test_index, ]
+
+# 3. Difference training series and align regressors
+diff_train <- diff(price_train)
+xreg_train_diff <- xreg_train[2:nrow(xreg_train), ]
+
+n_forecast <- nrow(test_data)
+print(n_forecast)
+# 4. Fit ARIMA+GARCH on training data
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(2, 1), include.mean = TRUE, external.regressors = xreg_train_diff)
+)
+
+garch_fit <- ugarchfit(spec, data = diff_train)
+
+
+
+## NEW !!!!!!
+
+# 5. Rolling 1-step-ahead forecast over all 179 months
+n_forecast <- nrow(test_data)
+#print(n_forecast)
+garch_forecast <- ugarchforecast(
+  garch_fit,
+  n.ahead = n_forecast,
+  external.forecasts = list(mreg = xreg_test)
+)
+
+# 6. Extract all 179 one-step-ahead predicted differences
+predicted_diff <- as.numeric(fitted(garch_forecast))
+
+# 7. Reconstruct predicted prices from predicted differences
+last_train_price <- tail(price_train, 1)
+predicted_prices <- cumsum(c(last_train_price, predicted_diff))[-1]
+
+# 8. Get actual test prices to compare
+actual_prices <- price_test[1:length(predicted_prices)]
+
+# 9. Compute MSE and RMSE
+mse <- mean((actual_prices - predicted_prices)^2)
+rmse <- sqrt(mse)
+
+cat("MSE:", round(mse, 4), "\n")
+cat("RMSE:", round(rmse, 4), "\n")
+
+
+```
+```{r}
+
+
+# Assume your original time series is already loaded as:
+# price_series <- ts(data$Price_Monthly_Avg)
+
+# 1. Create time series
+ts_data <- ts(price_series, start = c(1994, 10), frequency = 12)
+
+# 2. Log-transform the series
+log_ts <- log(ts_data)
+
+# 3. Plot the log-transformed series
+plot(log_ts, main = "Log-transformed Cocoa Prices", ylab = "Log(Price)", xlab = "Time")
+
+# 4. ADF test (null: non-stationary)
+#adf_result <- adf.test(log_ts)
+#cat("ADF p-value:", adf_result$p.value, "\n")
+
+# 5. KPSS test (null: stationary)
+#kpss_result <- kpss.test(log_ts)
+#cat("KPSS p-value:", kpss_result$p.value, "\n")
+
+diff_log <- diff(log_ts)
+adf_result <- adf.test(diff_log)
+cat("ADF p-value:", adf_result$p.value, "\n")
+
+# 5. KPSS test (null: stationary)
+kpss_result <- kpss.test(diff_log)
+cat("KPSS p-value:", kpss_result$p.value, "\n")
+```
+```{r}
+# 1. Load and prepare data
+data <- read.csv("/Users/kevin/Desktop/STA457_Project/price_climate.csv")
+data$Date <- as.Date(data[[1]])
+
+# External regressors matrix
+xreg_all <- as.matrix(data[, c("PRCP_Monthly_Avg", "TAVG_Monthly_Avg")])
+log_prices <- log(data$Price_Monthly_Avg)
+log_price_series <- ts(log_prices)
+
+# 2. Split based on date
+split_date <- as.Date("2018-11-30")
+train_index <- which(data$Date < split_date)
+test_index <- which(data$Date >= split_date)
+
+#train_data <- data[train_index, ]
+#test_data <- data[test_index, ]
+
+log_train <- ts(log_prices[train_index])
+log_test_actual_prices <- data$Price_Monthly_Avg[test_index]
+xreg_train <- xreg_all[train_index, ]
+xreg_test <- xreg_all[test_index, ]
+
+# 3. Difference training series and align regressors
+diff_log_train <- diff(log_train)
+xreg_train_diff <- xreg_train[2:nrow(xreg_train), ]
+
+n_forecast <- nrow(xreg_test)
+print(n_forecast)
+# 4. Fit ARIMA+GARCH on training data
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model = list(armaOrder = c(2, 1), include.mean = TRUE, external.regressors = xreg_train_diff)
+)
+n_forecast <- nrow(xreg_test)
+garch_fit <- ugarchfit(spec, data = diff_log_train, out.sample = n_forecast)
+
+
+
+## NEW !!!!!!
+
+# 5. Rolling 1-step-ahead forecast over all 179 months
+#print(n_forecast)
+garch_forecast <- ugarchforecast(
+  garch_fit,
+  n.ahead = 1,
+  n.roll = n_forecast - 1,
+  external.forecasts = list(mreg = xreg_test)
+)
+
+# 6. Extract all 179 one-step-ahead predicted differences
+predicted_diff_log <- as.numeric(fitted(garch_forecast)[1, ])
+
+# 7. Reconstruct predicted prices from predicted differences
+last_log_price <- tail(log_train, 1)
+predicted_log_prices <- cumsum(c(last_log_price, predicted_diff_log))[-1]
+predicted_prices <- exp(predicted_log_prices)
+length(predicted_prices)
+
+# 8. Get actual test prices to compare
+#actual_prices <- log_test_actual_prices[1:length(predicted_prices)]
+actual_prices <- data$Price_Monthly_Avg[test_index][1:length(predicted_prices)]
+
+# 9. Compute MSE and RMSE
+mse <- mean((actual_prices - predicted_prices)^2)
+rmse <- sqrt(mse)
+
+cat("MSE:", round(mse, 4), "\n")
+cat("RMSE:", round(rmse, 4), "\n")
+# 10. Compute MAE and MAPE
+mae <- mean(abs(actual_prices - predicted_prices))
+mape <- mean(abs((actual_prices - predicted_prices) / actual_prices)) * 100
+
+cat("MAE:", round(mae, 4), "\n")
+cat("MAPE:", round(mape, 2), "%\n")
+
+
+# === 10. Plot actual vs predicted prices ===
+time_index <- data$Date[test_index][1:length(predicted_prices)]
+
+# Plot
+plot(
+  time_index, actual_prices,
+  type = "l",
+  col = "red",
+  lwd = 2,
+  ylim = range(c(actual_prices, predicted_prices)),
+  ylab = "Price",
+  xlab = "Date",
+  main = "Actual vs Forecasted Cocoa Prices (Rolling Forecast)"
+)
+
+lines(time_index, predicted_prices, col = "blue", lwd = 2)
+
+legend("topleft", legend = c("Actual", "Forecasted"),
+       col = c("red", "blue"), lty = 1, lwd = 2)
+
+
+```
+```{r}
+mae <- mean(abs(actual_prices - predicted_prices))
+
+# MAPE (Mean Absolute Percentage Error)
+# Note: Avoid division by zero
+mape <- mean(abs((actual_prices - predicted_prices) / actual_prices)) * 100
+
+mae
+mape 
+```
