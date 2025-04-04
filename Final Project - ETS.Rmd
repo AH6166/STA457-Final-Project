@@ -1,0 +1,129 @@
+---
+title: "STA457 Final Project - ETS Model"
+author: Andrew Hu
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(forecast)
+library(readr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(urca)
+library(tseries)
+```
+
+```{r}
+cocoa_data <- read.csv("cocoa data ets.csv")
+cocoa_data$date <- as.Date(cocoa_data$date, format = "%m/%d/%Y")
+cocoa_data$Price <- as.numeric(gsub(",", "", cocoa_data$Price_Monthly_Avg))
+
+cocoa_data <- cocoa_data %>%
+  mutate(log_price = log(Price),
+         diff_log_price = c(NA, diff(log_price))) %>%
+  drop_na()
+```
+
+```{r}
+ggplot(cocoa_data, aes(x = date, y = Price_Monthly_Avg)) +
+  geom_line(color = "blue") +
+  ggtitle("Monthly Average Price Over Time") +
+  xlab("Year") +
+  ylab("Monthly Avgerage Price") +
+  theme_minimal()
+```
+
+```{r}
+price_ts <- ts(cocoa_data$Price_Monthly_Avg, start = c(1994, 10), frequency = 12)
+
+n <- length(price_ts)
+split_index <- floor(0.8 * n)
+train_data <- window(price_ts, end = time(price_ts)[split_index])
+test_data <- window(price_ts, start = time(price_ts)[split_index + 1])
+
+ets_model <- ets(train_data, model = "ZZZ")
+summary(ets_model)
+
+plot(residuals(ets_model), main = "Resiudal from ETS Model", xlab = "year", ylab = "residuals")
+
+forecast1 <- forecast(ets_model, h = length(test_data))
+
+autoplot(forecast1) +
+  autolayer(test_data, series = "Test Data") +
+  ggtitle("Price Forecast with ETS Model (80/20 Split)") +
+  xlab("Year") + 
+  ylab("Monthly Average Price") +
+  theme_minimal()
+
+accuracy(forecast1, test_data)
+```
+
+```{r}
+log_price_ts <- ts(cocoa_data$log_price, start = c(1994, 10), frequency = 12)
+
+
+n <- length(price_ts)
+split_index <- floor(0.8 * n)
+log_train_data <- window(log_price_ts, end = time(log_price_ts)[split_index])
+log_test_data <- window(log_price_ts, start = time(log_price_ts)[split_index + 1])
+
+log_ets_model <- ets(log_train_data, model = "ZZZ")
+summary(log_ets_model)
+
+log_forecast <- forecast(log_ets_model, h = length(log_test_data))
+
+# Back-transform
+log_forecast$mean <- exp(log_forecast$mean)
+log_forecast$lower <- exp(log_forecast$lower)
+log_forecast$upper <- exp(log_forecast$upper)
+log_forecast$x <- exp(log_forecast$x)
+
+autoplot(log_forecast) +
+  autolayer(test_data, series = "Test Data") +
+  ggtitle("ETS Forecast on Log-Transformed Prices (Back-Transformed)") +
+  xlab("Year") +
+  ylab("Monthly Average Price") +
+  theme_minimal()
+
+# Compare to test data
+
+accuracy(log_forecast, test_data)
+```
+
+```{r}
+diff_log_price <- ts(cocoa_data$diff_log_price, start = c(1994, 10), frequency = 12)
+
+n <- length(diff_log_price)
+split_index <- floor(0.8 * n)
+diff_log_train <- window(diff_log_price, end = time(price_ts)[split_index])
+diff_log_test <- window(diff_log_price, start = time(price_ts)[split_index + 1])
+
+diff_log_ets_model <- ets(diff_log_train, model = "ZZZ")
+summary(diff_log_ets_model)
+
+diff_log_forecast <- forecast(diff_log_ets_model, h = length(diff_log_test))
+
+forecasted_diffs <- diff_log_forecast$mean
+
+last_log_price <- tail(cocoa_data$log_price, 1)
+  
+# Reconstruct & back-transform
+log_price_forecast <- ts(cumsum(forecasted_diffs) + 7.3,
+                         start = time(diff_log_test)[1], frequency = 12)
+
+price_forecast <- exp(log_price_forecast)
+actual_price_test <- window(price_ts, start = time(diff_log_test)[1])
+
+# Plot forecast vs actual
+plot(price_forecast, col = "blue", lwd = 2, ylim = range(c(price_forecast, actual_price_test)),
+     main = "Forecasted vs Actual Prices BY ETS (Back-Transformed)", ylab = "Price", xlab = "Year")
+lines(actual_price_test, col = "red", lwd = 2)
+legend("topleft", legend = c("Forecast", "Actual"), col = c("blue", "red"), lty = 1, lwd = 2)
+
+accuracy(price_forecast, actual_price_test)
+```
+
