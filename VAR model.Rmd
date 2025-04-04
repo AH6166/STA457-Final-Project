@@ -1,0 +1,345 @@
+VAR model
+
+```{r}
+# Load required packages
+library(vars)
+library(tidyverse)
+library(lubridate)
+#install.packages("Metrics")
+library(Metrics)
+library(tseries)
+library(urca)
+```
+
+```{r}
+merged_df <- read_csv("~/merged_df.csv")
+# Convert Date column to Date class 
+merged_df$Date <- as.Date(merged_df$Date)
+
+# Set split date
+split_date <- as.Date("2018-11-30")
+
+# Split into training and test sets
+train_df <- merged_df %>% filter(Date < split_date)
+test_df <- merged_df %>% filter(Date >= split_date)
+
+# Drop the Date column for modeling
+train_data <- train_df %>% select(-Date)
+test_data <- test_df %>% select(-Date)
+```
+
+```{r}
+# Keep only numeric columns
+train_data <- train_data %>% dplyr::select(where(is.numeric))
+
+# Remove rows with NA, NaN, or Inf 
+train_data <- train_data[apply(train_data, 1, function(x) all(is.finite(x))), ]
+
+# Remove constant columns 
+train_data <- train_data[, sapply(train_data, function(x) length(unique(x)) > 1)]
+
+# Remove unused variables
+vars_to_remove <- c("Price_Monthly_Max", "TMAX_Monthly_Avg", "TMIN_Monthly_Avg")
+train_data <- train_data[, !(colnames(train_data) %in% vars_to_remove)]
+```
+
+
+
+
+
+```{r}
+me <- function(actual, predicted) {
+  mean(actual - predicted, na.rm = TRUE)
+}
+
+compare_var_models <- function(train_data, test_data, variable_sets, target = "Price_Monthly_Avg") {
+  results <- data.frame()
+  
+  for (i in seq_along(variable_sets)) {
+    vars <- unique(c(target, variable_sets[[i]]))
+    
+    # 1. Extract and convert to numeric
+    train_selected <- train_data[, vars]
+    test_selected <- test_data[, vars]
+    
+    train_selected <- as.data.frame(lapply(train_selected, function(x) as.numeric(as.character(x))))
+    test_selected <- as.data.frame(lapply(test_selected, function(x) as.numeric(as.character(x))))
+    
+    # 2. Remove non-positive values (for log)
+    train_selected[train_selected <= 0] <- NA
+    test_selected[test_selected <= 0] <- NA
+    
+    train_selected <- na.omit(train_selected)
+    test_selected <- na.omit(test_selected)
+    
+    # 3. Log transformation BEFORE stationarity test
+log_train_selected <- log(train_selected)
+log_test_selected <- log(test_selected)
+
+# 4. ADF test on log-transformed data
+non_stationary_vars <- c()
+cat("=== ADF Test Results for Variable Set", i, " (after log) ===\n")
+for (var_name in colnames(log_train_selected)) {
+  p_val <- tryCatch({
+    adf.test(log_train_selected[[var_name]], alternative = "stationary")$p.value
+  }, error = function(e) NA)
+
+  status <- ifelse(is.na(p_val), "ADF failed",
+                   ifelse(p_val < 0.05, "Stationary", "Non-stationary"))
+
+  cat(sprintf("Variable: %-25s | ADF p-value: %.4f (%s)\n", var_name, p_val, status))
+
+  if (!is.na(p_val) && p_val >= 0.05) {
+    non_stationary_vars <- c(non_stationary_vars, var_name)
+  }
+}
+cat("\n")
+
+# Replace old train_log and test_log
+train_log <- log_train_selected
+test_log <- log_test_selected
+
+    
+    # 5. Create aligned log set (drop first row for all)
+    train_log_trimmed <- train_log[-1, ]
+    
+    # 6. Build transformed data
+    transformed_list <- list()
+    for (var in colnames(train_log)) {
+      if (var %in% non_stationary_vars) {
+        transformed_list[[var]] <- diff(train_log[[var]])
+      } else {
+        transformed_list[[var]] <- train_log_trimmed[[var]]
+      }
+    }
+    
+    train_transformed <- as.data.frame(transformed_list)
+    train_transformed <- na.omit(train_transformed)
+    
+    if (nrow(train_transformed) < 10) {
+      cat(sprintf("⚠️ Skipped Variable Set %d: Too few observations after differencing (%d rows).\n\n", 
+                  i, nrow(train_transformed)))
+      results <- rbind(results, data.frame(
+        Variables = paste(variable_sets[[i]], collapse = ", "),
+        RMSE = NA, MAE = NA, MAPE = NA
+      ))
+      next
+    }
+
+    # 7. Fit VAR model (restrict lag to avoid overfitting)
+    lag_sel <- VARselect(train_transformed, lag.max = 3, type = "const")
+    p <- lag_sel$selection["AIC(n)"]
+    
+    var_model <- tryCatch({
+      VAR(train_transformed, p = p, type = "const")
+    }, error = function(e) {
+      cat(sprintf("⚠️ Skipped Variable Set %d: VAR model fitting failed — %s\n\n", i, e$message))
+      results <- rbind(results, data.frame(
+        Variables = paste(variable_sets[[i]], collapse = ", "),
+        RMSE = NA, MAE = NA, MAPE = NA
+      ))
+      return(NULL)
+    })
+    if (is.null(var_model)) next
+
+    # 8. Forecast
+    test_log_trimmed <- test_log[-1, ]
+    n_forecast <- nrow(test_log_trimmed)
+
+    forecast_result <- tryCatch({
+      predict(var_model, n.ahead = n_forecast)
+    }, error = function(e) {
+      cat(sprintf("⚠️ Skipped Variable Set %d: Forecast failed — %s\n\n", i, e$message))
+      results <- rbind(results, data.frame(
+        Variables = paste(variable_sets[[i]], collapse = ", "),
+        RMSE = NA, MAE = NA, MAPE = NA
+      ))
+      return(NULL)
+    })
+    if (is.null(forecast_result)) next
+
+    # 9. Reconstruct forecast
+    forecast_diff_log <- forecast_result$fcst[[target]][, "fcst"]
+    last_train_log <- tail(train_log[[target]], 1)
+    
+    forecast_log <- if (target %in% non_stationary_vars) {
+      cumsum(c(last_train_log, forecast_diff_log))[-1]
+    } else {
+      forecast_diff_log
+    }
+    
+    forecast_price <- exp(forecast_log)
+    
+    # 10. Align actual test target values
+    actual_test <- test_data[[target]][(nrow(test_data) - n_forecast + 1):nrow(test_data)]
+    
+    if (length(actual_test) != length(forecast_price)) {
+      cat(sprintf("⚠️ Skipped Variable Set %d: Forecast/Test length mismatch (%d vs %d).\n\n", 
+                  i, length(forecast_price), length(actual_test)))
+      results <- rbind(results, data.frame(
+        Variables = paste(variable_sets[[i]], collapse = ", "),
+        RMSE = NA, MAE = NA, MAPE = NA
+      ))
+      next
+    }
+
+    # 11. Calculate errors
+rmse_val <- rmse(actual_test, forecast_price)
+mae_val <- mae(actual_test, forecast_price)
+mape_val <- mape(actual_test, forecast_price) * 100
+me_val <- me(actual_test, forecast_price)
+
+    
+   # 12. Store result
+results <- rbind(results, data.frame(
+  Variables = paste(variable_sets[[i]], collapse = ", "),
+  RMSE = round(rmse_val, 4),
+  MAE = round(mae_val, 4),
+  MAPE = round(mape_val, 4),
+  ME = round(me_val, 4)
+))
+
+  }
+  
+  return(results)
+}
+
+
+```
+
+
+
+
+```{r}
+var_sets <- list(
+  c("PRCP_Monthly_Avg"),
+  c("PRCP_Monthly_Avg", "TAVG_Monthly_Avg"),
+  c("PRCP_Monthly_Avg", "TAVG_Monthly_Avg", "ExchangeRate"),
+  c("PRCP_Monthly_Avg", "TAVG_Monthly_Avg", "ExchangeRate", "Monthly_Production")
+)
+
+results <- compare_var_models(train_data, test_data, var_sets)
+print(results)
+
+
+
+```
+```{r}
+#Portmanteau Test
+serial.test(var_model, lags.pt = 12, type = "PT.asymptotic")
+
+#Residual Normality Test
+normality.test(var_model)
+
+#Heteroskedasticity
+arch.test(var_model, lags.multi = 12, multivariate.only = TRUE)
+
+#Stability Test
+roots(var_model, modulus = TRUE)  # Should all be < 1
+plot(roots(var_model))            # Visualize unit circle
+
+
+```
+
+Plot the best model (with Precipitation)
+
+```{r}
+
+library(tseries)
+library(vars)
+
+# === 1. Split data ===
+split_index <- floor(0.8 * nrow(merged_df))
+train_data <- merged_df[1:split_index, ]
+test_data <- merged_df[(split_index + 1):nrow(merged_df), ]
+
+# === 2. Set variables ===
+target <- "Price_Monthly_Avg"
+variables <- c(target, "PRCP_Monthly_Avg")
+
+# === 3. Prepare data (for modeling) ===
+train_selected <- train_data[, variables]
+test_selected <- test_data[, variables]
+
+# Convert to numeric
+train_selected <- as.data.frame(lapply(train_selected, function(x) as.numeric(as.character(x))))
+test_selected <- as.data.frame(lapply(test_selected, function(x) as.numeric(as.character(x))))
+
+# Remove non-positive values (for log transformation)
+train_selected[train_selected <= 0] <- NA
+test_selected[test_selected <= 0] <- NA
+train_selected <- na.omit(train_selected)
+test_selected <- na.omit(test_selected)
+
+# === 4. Check stationarity (ADF test) ===
+non_stationary_vars <- c()
+for (var in variables) {
+  pval <- adf.test(train_selected[[var]])$p.value
+  if (pval >= 0.05) non_stationary_vars <- c(non_stationary_vars, var)
+}
+
+# === 5. Log-transform and difference if needed ===
+train_log <- log(train_selected)
+test_log <- log(test_selected)
+
+transformed_list <- list()
+for (var in variables) {
+  if (var %in% non_stationary_vars) {
+    transformed_list[[var]] <- diff(train_log[[var]])
+  } else {
+    transformed_list[[var]] <- train_log[[var]][-1]
+  }
+}
+train_transformed <- as.data.frame(transformed_list)
+train_transformed <- na.omit(train_transformed)
+
+# === 6. Fit VAR model ===
+lag_sel <- VARselect(train_transformed, lag.max = 3, type = "const")
+p <- lag_sel$selection["AIC(n)"]
+var_model <- VAR(train_transformed, p = p, type = "const")
+
+# === 7. Forecast ===
+n_forecast <- nrow(test_selected)
+forecast_result <- predict(var_model, n.ahead = n_forecast)
+
+# === 8. Reconstruct forecasted series ===
+forecast_diff_log <- forecast_result$fcst[[target]][, "fcst"]
+last_train_log <- tail(log(train_selected[[target]]), 1)
+
+forecast_log <- if (target %in% non_stationary_vars) {
+  cumsum(c(last_train_log, forecast_diff_log))[-1]
+} else {
+  forecast_diff_log
+}
+forecast_price <- exp(forecast_log)
+
+# === 9. Prepare actual & date data for plotting ===
+# Use the original merged_df values and dates to preserve the true trend.
+n_forecast <- length(forecast_price)
+actual_prices <- tail(merged_df[[target]], n_forecast)
+forecast_dates <- as.Date(tail(merged_df$Date, n_forecast))  # ensure proper Date type
+
+# Combine into a data frame and sort by Date
+plot_df <- data.frame(
+  Date = forecast_dates,
+  Actual = actual_prices,
+  Forecast = forecast_price
+)
+plot_df <- plot_df[order(plot_df$Date), ]
+
+# === 10. Plot Actual vs. Forecasted Prices ===
+plot(
+  plot_df$Date, plot_df$Actual,
+  type = "l", col = "red", lwd = 2,
+  ylim = range(c(plot_df$Actual, plot_df$Forecast), na.rm = TRUE),
+  ylab = "Price", xlab = "Year",
+  main = "Actual vs Forecasted Cocoa Prices (VAR with PRCP_Monthly_Avg)"
+)
+lines(plot_df$Date, plot_df$Forecast, col = "blue", lwd = 2)
+legend("topleft", legend = c("Actual", "Forecasted"),
+       col = c("red", "blue"), lty = 1, lwd = 2)
+
+
+```
+
+
